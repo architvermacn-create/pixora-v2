@@ -115,7 +115,7 @@ export default function GenPage({
           )}
 
           {/* Prompt */}
-          {!requiresImage || prompt !== undefined && (
+          {(!requiresImage || prompt !== undefined) && (
             <div>
               <label className="block text-sm text-gray-400 mb-2">
                 {requiresImage ? 'Additional Instructions (optional)' : 'Prompt'}
