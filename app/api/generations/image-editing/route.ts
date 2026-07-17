@@ -19,10 +19,7 @@ export async function POST(request: NextRequest) {
   const user = decodeJWT(token);
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-  );
+  const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { global: { headers: { Authorization: `Bearer ${token}` } } });
 
   // Check credits
   const { data: profile, error: profileErr } = await supabase
