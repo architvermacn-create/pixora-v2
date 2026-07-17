@@ -19,7 +19,7 @@ export async function POST(request: NextRequest) {
   const user = decodeJWT(token);
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
-  const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!);
+  const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { global: { headers: { Authorization: `Bearer ${token}` } } });
 
   const { data: profile, error: profileErr } = await supabase.from('profiles').select('credits').eq('id', user.id).single();
   if (profileErr || !profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
