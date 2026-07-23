@@ -1,43 +1,120 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import Replicate from 'replicate';
+import { enhanceImagePrompt } from '@/lib/prompt-enhance';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 60;
 
-function decodeJWT(token: string) {
-  try {
-    const p = JSON.parse(Buffer.from(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString());
-    return p.sub ? { id: p.sub, email: p.email } : null;
-  } catch { return null; }
-}
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const CREDITS_COST = 1;
+
+const hasReplicate = () => {
+  const t = process.env.REPLICATE_API_TOKEN;
+  return !!t && !t.startsWith('r8_placeholder');
+};
 
 export async function POST(request: NextRequest) {
-  const token = request.headers.get('Authorization')?.replace('Bearer ', '');
-  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const user = decodeJWT(token);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { global: { headers: { Authorization: `Bearer ${token}` } } });
-
-  const { data: profile, error: profileErr } = await supabase.from('profiles').select('credits').eq('id', user.id).single();
-  if (profileErr || !profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
-  if (profile.credits < 1) return NextResponse.json({ error: 'Insufficient credits.' }, { status: 402 });
-
-  const { prompt, negativePrompt, width, height, steps } = await request.json();
-  await supabase.from('profiles').update({ credits: profile.credits - 1, updated_at: new Date().toISOString() }).eq('id', user.id);
-
   try {
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN! });
-    const input: any = { prompt, negative_prompt: negativePrompt || '', width: width || 1024, height: height || 1024, num_inference_steps: steps || 4 };
-    const { data: gen } = await supabase.from('generations').insert({ user_id: user.id, type: 'text-to-image', prompt, status: 'processing', credits_used: 1, created_at: new Date().toISOString() }).select().single();
-    const output = await replicate.run('black-forest-labs/flux-schnell' as any, { input }) as any;
-    const outputUrl = Array.isArray(output) ? output[0] : (output?.url?.() ? await output.url() : output);
-    if (gen?.id) await supabase.from('generations').update({ output_url: String(outputUrl), status: 'completed' }).eq('id', gen.id);
-    return NextResponse.json({ url: String(outputUrl), creditsUsed: 1 });
-  } catch (err: any) {
-    await supabase.from('profiles').update({ credits: profile.credits, updated_at: new Date().toISOString() }).eq('id', user.id);
-    return NextResponse.json({ error: err.message || 'Generation failed' }, { status: 500 });
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader?.startsWith('Bearer ')) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const token = authHeader.slice(7);
+
+    // Secure auth via Supabase token verification
+    const authClient = createClient(supabaseUrl, anonKey);
+    const { data: { user }, error: authError } = await authClient.auth.getUser(token);
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { prompt, aspectRatio = '1:1' } = await request.json();
+    if (!prompt?.trim()) {
+      return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
+    }
+
+    const db = createClient(supabaseUrl, anonKey, {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+      auth: { persistSession: false },
+    });
+
+    const { data: profile } = await db.from('profiles').select('credits').eq('id', user.id).single();
+    if (!profile || profile.credits < CREDITS_COST) {
+      return NextResponse.json({ error: 'Insufficient credits' }, { status: 402 });
+    }
+
+    // ── Intelligent Prompt Enhancement ─────────────────────────────────────
+    const { positive: enhancedPrompt, negative: negativePrompt, useHighQualityModel } = enhanceImagePrompt(prompt.trim());
+
+    let imageUrl: string;
+    let isMock = false;
+
+    if (hasReplicate()) {
+      try {
+        const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+
+        // Use flux-dev for deity/portrait (higher quality), flux-schnell for speed
+        if (useHighQualityModel) {
+          const output = await replicate.run('black-forest-labs/flux-dev', {
+            input: {
+              prompt: enhancedPrompt,
+              num_outputs: 1,
+              num_inference_steps: 28,
+              guidance_scale: 3.5,
+              output_format: 'webp' as const,
+              output_quality: 95,
+              aspect_ratio: aspectRatio as '1:1' | '16:9' | '9:16' | '4:3' | '3:4',
+              go_fast: false,
+            },
+          });
+          const out = Array.isArray(output) ? output[0] : output;
+          imageUrl = typeof out === 'object' && out !== null && 'url' in out
+            ? (out as { url: () => string }).url()
+            : String(out);
+        } else {
+          const output = await replicate.run('black-forest-labs/flux-schnell', {
+            input: {
+              prompt: enhancedPrompt,
+              num_outputs: 1,
+              num_inference_steps: 4,
+              output_format: 'webp' as const,
+              output_quality: 95,
+              aspect_ratio: aspectRatio as '1:1' | '16:9' | '9:16' | '4:3' | '3:4',
+              go_fast: true,
+              megapixels: '1' as const,
+            },
+          });
+          const out = Array.isArray(output) ? output[0] : output;
+          imageUrl = typeof out === 'object' && out !== null && 'url' in out
+            ? (out as { url: () => string }).url()
+            : String(out);
+        }
+      } catch (genError) {
+        console.error('Flux generation error:', genError);
+        return NextResponse.json({ error: 'Image generation failed. No credits were deducted.' }, { status: 500 });
+      }
+    } else {
+      await new Promise(r => setTimeout(r, 1500));
+      imageUrl = 'https://images.pexels.com/photos/1103970/pexels-photo-1103970.jpeg?auto=compress&cs=tinysrgb&w=1024';
+      isMock = true;
+    }
+
+    // Deduct credits only after successful generation
+    await db.from('profiles').update({ credits: profile.credits - CREDITS_COST }).eq('id', user.id);
+    await db.from('transactions').insert({
+      user_id: user.id,
+      amount: -CREDITS_COST,
+      credits: CREDITS_COST,
+      type: 'usage',
+      description: `Text to Image: ${prompt.trim().slice(0, 60)}`,
+      status: 'completed',
+    });
+
+    return NextResponse.json({ imageUrl, isMock, creditsRemaining: profile.credits - CREDITS_COST });
+  } catch (error) {
+    console.error('text-to-image error:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
