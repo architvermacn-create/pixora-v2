@@ -3,65 +3,95 @@ import { createClient } from '@supabase/supabase-js';
 import Replicate from 'replicate';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 60;
 
-function decodeJWT(token: string) {
-  try {
-    const p = JSON.parse(Buffer.from(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString());
-    return p.sub ? { id: p.sub, email: p.email } : null;
-  } catch { return null; }
-}
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const CREDITS_COST = 0; // Free feature
 
 export async function POST(request: NextRequest) {
-  const token = request.headers.get('Authorization')?.replace('Bearer ', '');
-  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const user = decodeJWT(token);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-
-  const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { global: { headers: { Authorization: `Bearer ${token}` } } });
-
-  // Check credits
-  const { data: profile, error: profileErr } = await supabase
-    .from('profiles').select('credits').eq('id', user.id).single();
-  if (profileErr || !profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
-  if (profile.credits < 1) return NextResponse.json({ error: 'Insufficient credits. Please upgrade your plan.' }, { status: 402 });
-
-  const body = await request.json();
-  const { prompt, imageUrl, negativePrompt, width, height, steps } = body;
-
-  // Deduct credits first
-  await supabase.from('profiles').update({ credits: profile.credits - 1, updated_at: new Date().toISOString() }).eq('id', user.id);
-
   try {
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN! });
-    const input: any = { image: imageUrl };
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader?.startsWith('Bearer ')) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const token = authHeader.slice(7);
 
-    // Log to generations table
-    const { data: gen } = await supabase.from('generations').insert({
-      user_id: user.id,
-      type: 'background-removal',
-      prompt: prompt || imageUrl || 'generation',
-      status: 'processing',
-      credits_used: 1,
-      created_at: new Date().toISOString(),
-    }).select().single();
-
-    const output = await replicate.run('cjwbw/rembg:fb8af171cfa1616ddcf1242c093f9c46bcada5ad4cf6f2fbe8b81b330ec5c003' as any, { input }) as any;
-    const outputUrl = Array.isArray(output) ? output[0] : (output?.url?.() ? await output.url() : output);
-
-    // Update generation record
-    if (gen?.id) {
-      await supabase.from('generations').update({
-        output_url: String(outputUrl),
-        status: 'completed',
-      }).eq('id', gen.id);
+    // Secure auth via Supabase token verification
+    const authClient = createClient(supabaseUrl, anonKey);
+    const { data: { user }, error: authError } = await authClient.auth.getUser(token);
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    return NextResponse.json({ url: String(outputUrl), creditsUsed: 1 });
-  } catch (err: any) {
-    // Refund credits on error
-    await supabase.from('profiles').update({ credits: profile.credits, updated_at: new Date().toISOString() }).eq('id', user.id);
-    return NextResponse.json({ error: err.message || 'Generation failed' }, { status: 500 });
+    const { imageUrl = '' } = await request.json();
+    if (!imageUrl) {
+      return NextResponse.json({ error: 'Image URL is required' }, { status: 400 });
+    }
+
+    const db = createClient(supabaseUrl, anonKey, {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+      auth: { persistSession: false },
+    });
+
+    const { data: profile } = await db.from('profiles').select('credits').eq('id', user.id).single();
+    if (!profile) {
+      return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
+    }
+
+    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+
+    // ── BRIA RMBG 2.0 — State-of-the-art background removal ────────
+    // Massively superior to rembg: handles hair, fur, complex edges, transparency
+    let resultImageUrl: string;
+    try {
+      const output = await replicate.run(
+        'bria-ai/rmbg-2.0',
+        {
+          input: {
+            image: imageUrl,
+          },
+        }
+      );
+      const out = Array.isArray(output) ? output[0] : output;
+      resultImageUrl = typeof out === 'object' && out !== null && 'url' in out
+        ? (out as { url: () => string }).url()
+        : String(out);
+    } catch (err) {
+      console.error('Background removal error (bria-ai/rmbg-2.0):', err);
+      // Fallback to rembg if BRIA fails
+      try {
+        const fallback = await replicate.run(
+          'cjwbw/rembg:fb8af171cfa1616ddcf1242c093f9c46bcada5ad4cf6f2fbe8b81b330ec5c003',
+          { input: { image: imageUrl } }
+        );
+        const out = Array.isArray(fallback) ? fallback[0] : fallback;
+        resultImageUrl = typeof out === 'object' && out !== null && 'url' in out
+          ? (out as { url: () => string }).url()
+          : String(out);
+      } catch (fallbackErr) {
+        console.error('Background removal fallback also failed:', fallbackErr);
+        return NextResponse.json({ error: 'Background removal failed. Please try again.' }, { status: 500 });
+      }
+    }
+
+    // Log usage (free — no credit deduction)
+    await db.from('transactions').insert({
+      user_id: user.id,
+      amount: 0,
+      credits: 0,
+      type: 'usage',
+      description: 'Background Removal (Free)',
+      status: 'completed',
+    });
+
+    return NextResponse.json({
+      imageUrl: resultImageUrl,
+      isMock: false,
+      creditsRemaining: profile.credits,
+    });
+  } catch (error) {
+    console.error('background-removal error:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
