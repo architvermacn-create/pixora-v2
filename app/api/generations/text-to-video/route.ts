@@ -1,38 +1,109 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import Replicate from 'replicate';
+import { enhanceVideoPrompt } from '@/lib/prompt-enhance';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 300;
 
-function decodeJWT(token: string) {
-  try {
-    const p = JSON.parse(Buffer.from(token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString());
-    return p.sub ? { id: p.sub, email: p.email } : null;
-  } catch { return null; }
-}
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
+// Duration-based credit costs
+const CREDITS: Record<string, number> = {
+  '5sec': 5,
+  '10sec': 10,
+};
+
+const hasReplicate = () => {
+  const t = process.env.REPLICATE_API_TOKEN;
+  return !!t && !t.startsWith('r8_placeholder');
+};
 
 export async function POST(request: NextRequest) {
-  const token = request.headers.get('Authorization')?.replace('Bearer ', '');
-  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  const user = decodeJWT(token);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, { global: { headers: { Authorization: `Bearer ${token}` } } });
-  const { data: profile, error: profileErr } = await supabase.from('profiles').select('credits').eq('id', user.id).single();
-  if (profileErr || !profile) return NextResponse.json({ error: 'Profile not found' }, { status: 404 });
-  if (profile.credits < 5) return NextResponse.json({ error: 'Insufficient credits.' }, { status: 402 });
-  const { prompt } = await request.json();
-  await supabase.from('profiles').update({ credits: profile.credits - 5, updated_at: new Date().toISOString() }).eq('id', user.id);
   try {
-    const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN! });
-    const input: any = { prompt, duration: 5 };
-    const { data: gen } = await supabase.from('generations').insert({ user_id: user.id, type: 'text-to-video', prompt, status: 'processing', credits_used: 5, created_at: new Date().toISOString() }).select().single();
-    const output = await replicate.run('luma/ray-flash-2' as any, { input }) as any;
-    const outputUrl = Array.isArray(output) ? output[0] : (output?.url?.() ? await output.url() : output);
-    if (gen?.id) await supabase.from('generations').update({ output_url: String(outputUrl), status: 'completed' }).eq('id', gen.id);
-    return NextResponse.json({ url: String(outputUrl), creditsUsed: 5 });
-  } catch (err: any) {
-    await supabase.from('profiles').update({ credits: profile.credits, updated_at: new Date().toISOString() }).eq('id', user.id);
-    return NextResponse.json({ error: err.message || 'Generation failed' }, { status: 500 });
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader?.startsWith('Bearer ')) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const token = authHeader.slice(7);
+
+    // Secure auth via Supabase token verification
+    const authClient = createClient(supabaseUrl, anonKey);
+    const { data: { user }, error: authError } = await authClient.auth.getUser(token);
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { prompt = '', duration = '5sec' } = await request.json();
+    if (!prompt?.trim()) {
+      return NextResponse.json({ error: 'Prompt is required' }, { status: 400 });
+    }
+
+    const creditsCost = CREDITS[duration] ?? CREDITS['5sec'];
+
+    const db = createClient(supabaseUrl, anonKey, {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+      auth: { persistSession: false },
+    });
+
+    const { data: profile } = await db.from('profiles').select('credits').eq('id', user.id).single();
+    if (!profile || profile.credits < creditsCost) {
+      return NextResponse.json({ error: 'Insufficient credits' }, { status: 402 });
+    }
+
+    // ── Intelligent Video Prompt Enhancement ─────────────────────────────────────
+    const enhancedPrompt = enhanceVideoPrompt(prompt.trim());
+
+    let videoUrl: string;
+    let isMock = false;
+
+    if (hasReplicate()) {
+      try {
+        const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+
+        // ── MiniMax Video-01 — Best text-to-video model ───────────────────────
+        // Superior to stable-video-diffusion for text-to-video
+        // Generates cinematic quality 5-6 second videos from text prompts
+
+        const output = await replicate.run(
+          'minimax/video-01',
+          {
+            input: {
+              prompt: enhancedPrompt,
+              prompt_optimizer: true, // Let MiniMax also optimize the prompt
+            },
+          }
+        );
+
+        const out = Array.isArray(output) ? output[0] : output;
+        videoUrl = typeof out === 'object' && out !== null && 'url' in out
+          ? (out as { url: () => string }).url()
+          : String(out);
+      } catch (genError) {
+        console.error('Text-to-video generation error:', genError);
+        return NextResponse.json({ error: 'Video generation failed. No credits were deducted.' }, { status: 500 });
+      }
+    } else {
+      await new Promise(r => setTimeout(r, 2000));
+      videoUrl = 'https://images.pexels.com/photos/2510428/pexels-photo-2510428.jpeg?auto=compress&cs=tinysrgb&w=1024';
+      isMock = true;
+    }
+
+    // Deduct credits only after successful generation
+    await db.from('profiles').update({ credits: profile.credits - creditsCost }).eq('id', user.id);
+    await db.from('transactions').insert({
+      user_id: user.id,
+      amount: -creditsCost,
+      credits: creditsCost,
+      type: 'usage',
+      description: `Text to Video (${duration}): ${prompt.trim().slice(0, 60)}`,
+      status: 'completed',
+    });
+
+    return NextResponse.json({ videoUrl, isMock, creditsRemaining: profile.credits - creditsCost });
+  } catch (error) {
+    console.error('text-to-video error:', error);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
